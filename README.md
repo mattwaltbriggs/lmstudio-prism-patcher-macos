@@ -85,8 +85,10 @@ to start.
 
 * **Standalone** – only `curl`, `jq`, and `tar` are required.
 * **Dynamic fetching** – queries the GitHub API for the latest PrismML release.
-* **Auto-targeting** – detects the CPU architecture and scans
-  `~/.lmstudio/extensions/backends` for the highest-version matching backend.
+* **Auto-targeting** – detects the CPU architecture and patches **every** matching
+  backend in `~/.lmstudio/extensions/backends`. LM Studio switches between installed
+  backends on its own, so patching only the newest one silently stops working as soon
+  as it moves to a different version.
 * **Surgical, side-by-side patching** – never breaks LM Studio's signed in-process engine.
 * **Backup + rollback** – originals are saved to `.prism-backup/` inside the backend directory.
 
@@ -103,8 +105,8 @@ chmod +x prism_patcher.sh
 ./prism_patcher.sh
 ```
 
-Then restart LM Studio. The script patches the highest-version backend; make sure LM Studio is
-using that version (model load settings → **Runtime** dropdown).
+Then restart LM Studio. The script patches all installed `llama.cpp-mac-*` backends, so it
+doesn't matter which one LM Studio picks (the preferred version is printed when known).
 
 ### Advanced targets
 
@@ -131,13 +133,31 @@ LMSTUDIO_BACKENDS_DIR=/path/to/backends ./prism_patcher.sh
 ## Caveats
 
 * **LM Studio updates the backend automatically.** With `autoUpdateExtensionPacks` /
-  `autoDeleteExtensionPacks` enabled, LM Studio downloads a new backend and deletes the old one,
-  wiping the patch. Re-run the script after each update, or disable those options in
-  **Settings → Developer**.
+  `autoDeleteExtensionPacks` enabled, LM Studio can download a new backend and delete the old
+  one — sometimes *while you are patching*. Re-run the script after each update, or disable
+  those options in **Settings → Developer**. Because the script patches every installed
+  backend, a brand-new version that arrives after the run still needs a re-run.
 * Only the engine-protocol `llama-server` path (chat/completion) is patched. Embeddings that run
   through the in-process `llm_engine.node` keep using LM Studio's libraries.
 * PrismML's server must remain CLI/API-compatible with the engine protocol LM Studio expects.
   The script aborts and restores the originals if the patched server fails a startup smoke test.
+
+## Troubleshooting
+
+**A model fails with `tensor '...' has invalid ggml type 143. should be in [0, 43)`** (or any type
+number `>= 43`). The engine that ran is an **unpatched** LM Studio build — it doesn't know the
+PrismML quantization types. Check which backend LM Studio is actually using:
+
+```bash
+cat ~/.lmstudio/.internal/backend-preferences-v1.json
+ls -l ~/.lmstudio/extensions/backends/llama.cpp-mac-arm64-*/llama-server
+```
+
+A patched `llama-server` is small (~33 KB); LM Studio's stock one is ~52 KB. Re-run the patcher,
+then restart LM Studio.
+
+Engine logs live in `~/.lmstudio/server-logs/<year>-<month>/*.log`, and the full app log is in
+`~/Library/Logs/LM Studio/main.log`.
 
 ## Credits
 

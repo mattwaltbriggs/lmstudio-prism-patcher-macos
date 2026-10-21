@@ -22,6 +22,7 @@ fi
 
 # Where LM Studio keeps its engine backends
 BACKENDS_DIR="${LMSTUDIO_BACKENDS_DIR:-$HOME/.lmstudio/extensions/backends}"
+INTERNAL_DIR="${LMSTUDIO_INTERNAL_DIR:-$HOME/.lmstudio/.internal}"
 
 # Default PrismML target for the host architecture
 case "$ARCH" in
@@ -68,106 +69,150 @@ curl -fL -o "$TEMP_DIR/prism.tar.gz" "$ASSET_URL"
 tar -xzf "$TEMP_DIR/prism.tar.gz" -C "$TEMP_DIR" --strip-components=1
 chmod +x "$TEMP_DIR/llama-server" 2>/dev/null || true
 
-# The release tag/version, used for display only
+# The release tag/version, used for display only (llama-server prints to stderr)
 echo "PrismML: $("$TEMP_DIR/llama-server" --version 2>&1 | head -n1 || echo unknown)"
 
-# 3. Locate the highest-version LM Studio backend for this architecture
-echo "[3/4] Locating the highest version LM Studio backend matching $BACKEND_PATTERN..."
+# Files the PrismML llama-server subprocess loads by name and that we must
+# replace (they are only ever consumed by the subprocess, never by LM Studio's
+# in-process llm_engine.node):
+#   - llama-server
+#   - libllama-server-impl.dylib
+#   - libllama-common.0.dylib (repointed to PrismML's versioned build)
+OVERWRITE_FILES="llama-server libllama-server-impl.dylib"
+REPOINT_SYMLINKS="libllama-common.0.dylib"
+
+# Patch a single backend directory. Returns 0 on success, 1 on failure (and
+# rolls that backend back to its pre-patch state).
+patch_backend() {
+    backend="$1"
+    backup="$backend/.prism-backup"
+    mkdir -p "$backup"
+    chmod -R u+w "$backend" 2>/dev/null || true
+
+    # Snapshot anything we are about to overwrite / repoint
+    for f in $OVERWRITE_FILES; do
+        if [ -f "$backend/$f" ] && [ ! -e "$backup/$f" ]; then
+            cp -p "$backend/$f" "$backup/$f"
+        fi
+    done
+    for l in $REPOINT_SYMLINKS; do
+        if [ -L "$backend/$l" ] && [ ! -e "$backup/$l.target" ]; then
+            readlink "$backend/$l" > "$backup/$l.target"
+        fi
+    done
+
+    # Install PrismML's version-suffixed dylibs side by side with LM Studio's
+    # unversioned, signed libraries and wire up the versioned/plain symlinks.
+    for src in "$TEMP_DIR"/*.dylib; do
+        [ -e "$src" ] || continue
+        [ -L "$src" ] && continue
+
+        base="$(basename "$src")"
+        case "$base" in
+            *.[0-9]*.[0-9]*.[0-9]*.dylib)
+                cp -f "$src" "$backend/$base"
+                stem="${base%%.[0-9]*.[0-9]*.[0-9]*.dylib}"
+                ln -sfn "$base" "$backend/${stem}.0.dylib"
+                if [ ! -e "$backend/${stem}.dylib" ]; then
+                    ln -sfn "$base" "$backend/${stem}.dylib"
+                fi
+                ;;
+        esac
+    done
+
+    # The engine-protocol subprocess binaries
+    cp -f "$TEMP_DIR/llama-server" "$backend/llama-server"
+    cp -f "$TEMP_DIR/libllama-server-impl.dylib" "$backend/libllama-server-impl.dylib"
+    chmod +x "$backend/llama-server"
+
+    # Strip quarantine if the archive came from a browser download
+    if command -v xattr >/dev/null 2>&1; then
+        xattr -dr com.apple.quarantine "$backend" 2>/dev/null || true
+    fi
+
+    # Smoke test: make sure the patched server starts and resolves every lib
+    if ! "$backend/llama-server" --version >/dev/null 2>&1; then
+        echo "    ! smoke test failed, rolling back this backend"
+        for f in $OVERWRITE_FILES; do
+            [ -e "$backup/$f" ] && cp -p "$backup/$f" "$backend/$f"
+        done
+        for l in $REPOINT_SYMLINKS; do
+            [ -f "$backup/$l.target" ] && ln -sfn "$(cat "$backup/$l.target")" "$backend/$l"
+        done
+        for src in "$TEMP_DIR"/*.dylib; do
+            [ -e "$src" ] || continue
+            base="$(basename "$src")"
+            case "$base" in
+                *.[0-9]*.[0-9]*.[0-9]*.dylib)
+                    stem="${base%%.[0-9]*.[0-9]*.[0-9]*.dylib}"
+                    rm -f "$backend/$base"
+                    rm -f "$backend/${stem}.0.dylib"
+                    [ -L "$backend/${stem}.dylib" ] && rm -f "$backend/${stem}.dylib"
+                    ;;
+            esac
+        done
+        return 1
+    fi
+
+    return 0
+}
+
+# 3. Locate LM Studio backends for this architecture
+echo "[3/4] Locating LM Studio backends matching $BACKEND_PATTERN..."
 
 if [ ! -d "$BACKENDS_DIR" ]; then
     echo "Error: '$BACKENDS_DIR' does not exist. Is LM Studio installed and has it run at least once?"
     exit 1
 fi
 
-# Portable "sort -V": zero-pad each numeric component, then sort.
-# macOS/BSD sort has no -V flag.
-LM_BACKEND_DIR=$(find "$BACKENDS_DIR" -maxdepth 1 -type d -name "$BACKEND_PATTERN" 2>/dev/null \
+# Portable "sort -V" (BSD sort has no -V): zero-pad each numeric component.
+# NOTE: we patch *every* matching backend, not just the newest one. LM Studio
+# switches between installed backends on its own (and auto-downloads new ones),
+# so patching only the highest version silently stops working when it switches.
+BACKEND_LIST=$(find "$BACKENDS_DIR" -maxdepth 1 -type d -name "$BACKEND_PATTERN" 2>/dev/null \
     | awk -F/ '{
         v=$NF; sub(/^.*-/, "", v); n=split(v, a, ".");
         printf "%05d%05d%05d\t%s\n", a[1], a[2], a[3], $0
     }' \
-    | sort -r | head -n1 | cut -f2)
+    | sort -r | cut -f2)
 
-if [ -z "$LM_BACKEND_DIR" ] || [ ! -d "$LM_BACKEND_DIR" ]; then
-    echo "Error: could not find an LM Studio backend matching '$BACKEND_PATTERN' in $BACKENDS_DIR."
+if [ -z "$BACKEND_LIST" ]; then
+    echo "Error: could not find any LM Studio backend matching '$BACKEND_PATTERN' in $BACKENDS_DIR."
     exit 1
 fi
 
-echo "Targeting backend: $LM_BACKEND_DIR"
+echo "Found backends:"
+echo "$BACKEND_LIST" | sed 's|.*/|    |'
 
-# 4. Patch the backend
-echo "[4/4] Patching the backend..."
+if [ -f "$INTERNAL_DIR/backend-preferences-v1.json" ]; then
+    PREFERRED=$(jq -r '.[] | select(.name | test("^llama.cpp-")) | .version' \
+        "$INTERNAL_DIR/backend-preferences-v1.json" 2>/dev/null | head -n1 || true)
+    [ -n "$PREFERRED" ] && echo "LM Studio currently prefers version: $PREFERRED"
+fi
 
-BACKUP_DIR="$LM_BACKEND_DIR/.prism-backup"
-mkdir -p "$BACKUP_DIR"
+# 4. Patch every backend
+echo "[4/4] Patching backends..."
+PATCHED=0
+FAILED=0
 
-# Make the directory writable without breaking symlinks
-chmod -R u+w "$LM_BACKEND_DIR" 2>/dev/null || true
-
-# Back up the two LM Studio files we intentionally overwrite (once)
-for f in llama-server libllama-server-impl.dylib; do
-    if [ -f "$LM_BACKEND_DIR/$f" ] && [ ! -e "$BACKUP_DIR/$f" ]; then
-        cp -p "$LM_BACKEND_DIR/$f" "$BACKUP_DIR/$f"
+while IFS= read -r backend; do
+    [ -n "$backend" ] || continue
+    echo "  -> $backend"
+    if patch_backend "$backend"; then
+        PATCHED=$((PATCHED + 1))
+    else
+        FAILED=$((FAILED + 1))
     fi
-done
-
-# Copy PrismML's version-suffixed dylibs (e.g. libllama.0.2.0.dylib) and wire up
-# the versioned/plain symlinks. We NEVER clobber LM Studio's unversioned
-# libraries: LM Studio's in-process engine (llm_engine.node -> libllm_engine.dylib)
-# is built against those exact builds and needs them (it references symbols that
-# PrismML's fork does not export). Keeping both sets side by side lets the
-# engine-protocol llama-server subprocess run PrismML while the rest of LM Studio
-# keeps its signed, symbol-compatible libraries.
-for src in "$TEMP_DIR"/*.dylib; do
-    [ -e "$src" ] || continue
-    [ -L "$src" ] && continue
-
-    base="$(basename "$src")"
-    case "$base" in
-        *.[0-9]*.[0-9]*.[0-9]*.dylib)
-            cp -f "$src" "$LM_BACKEND_DIR/$base"
-            stem="${base%%.[0-9]*.[0-9]*.[0-9]*.dylib}"
-            ln -sfn "$base" "$LM_BACKEND_DIR/${stem}.0.dylib"
-            if [ ! -e "$LM_BACKEND_DIR/${stem}.dylib" ]; then
-                ln -sfn "$base" "$LM_BACKEND_DIR/${stem}.dylib"
-            fi
-            ;;
-    esac
-done
-
-# PrismML's llama-server executable (ad-hoc/linker-signed) and its server impl.
-cp -f "$TEMP_DIR/llama-server" "$LM_BACKEND_DIR/llama-server"
-cp -f "$TEMP_DIR/libllama-server-impl.dylib" "$LM_BACKEND_DIR/libllama-server-impl.dylib"
-chmod +x "$LM_BACKEND_DIR/llama-server"
-
-# The prism llama-server links @rpath/libllama-common.0.dylib; point that at the
-# PrismML build (the loop above already repointed it, this is belt-and-braces).
-prism_common="$(ls "$TEMP_DIR"/libllama-common.*.*.*.dylib 2>/dev/null | head -n1 || true)"
-if [ -n "$prism_common" ]; then
-    ln -sfn "$(basename "$prism_common")" "$LM_BACKEND_DIR/libllama-common.0.dylib"
-fi
-
-# Remove the quarantine attribute if the archive came from a browser download
-if command -v xattr >/dev/null 2>&1; then
-    xattr -dr com.apple.quarantine "$LM_BACKEND_DIR" 2>/dev/null || true
-fi
-
-# Sanity check: make sure the freshly copied server actually starts and resolves
-# all of its PrismML libraries.
-if ! "$LM_BACKEND_DIR/llama-server" --version >/dev/null 2>&1; then
-    echo "Warning: the patched llama-server failed a smoke test. Restoring LM Studio's original binaries."
-    for f in llama-server libllama-server-impl.dylib; do
-        [ -e "$BACKUP_DIR/$f" ] && cp -p "$BACKUP_DIR/$f" "$LM_BACKEND_DIR/$f"
-    done
-    if [ -n "$prism_common" ]; then
-        rm -f "$LM_BACKEND_DIR/$(basename "$prism_common")"
-    fi
-    echo "Error: patch aborted. Your backend was left as it was."
-    exit 1
-fi
+done <<EOF
+$BACKEND_LIST
+EOF
 
 echo "=========================================="
-echo " Patching complete!"
+echo " Patched $PATCHED backend(s), $FAILED failed."
 echo " Restart LM Studio to apply the new binaries."
-echo " (Original files backed up in: $BACKUP_DIR)"
+echo " (Originals backed up in .prism-backup/ inside each backend)"
 echo "=========================================="
+
+if [ "$PATCHED" -eq 0 ]; then
+    exit 1
+fi
