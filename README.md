@@ -91,6 +91,8 @@ to start.
   as it moves to a different version.
 * **Surgical, side-by-side patching** – never breaks LM Studio's signed in-process engine.
 * **Backup + rollback** – originals are saved to `.prism-backup/` inside the backend directory.
+* **Auto-patching watcher** – `install-watcher.sh` installs a launchd agent that re-patches new
+  backends on its own (see below).
 
 ## Requirements
 
@@ -107,6 +109,50 @@ chmod +x prism_patcher.sh
 
 Then restart LM Studio. The script patches all installed `llama.cpp-mac-*` backends, so it
 doesn't matter which one LM Studio picks (the preferred version is printed when known).
+
+## Automatic patching (recommended)
+
+LM Studio re-downloads its runtime backends on app updates and can switch versions whenever it
+likes, which silently undoes a manual patch. `install-watcher.sh` installs a macOS **launchd user
+agent** that keeps every backend patched for you:
+
+```bash
+./install-watcher.sh            # install (or reinstall)
+./install-watcher.sh status     # agent state + whether backends are patched
+./install-watcher.sh uninstall  # remove the agent
+```
+
+It triggers on:
+
+* **`WatchPaths`** on `~/.lmstudio/extensions/backends` — fires the moment LM Studio installs a
+  backend, so a freshly downloaded version is patched seconds later.
+* **`RunAtLoad`** — patches at login/boot.
+* **`StartInterval` (15 min)** — safety net for in-place rewrites.
+
+Each run first calls `prism_patcher.sh --check`, a purely local test (no network) of whether every
+installed backend carries a `.prism-stamp` marker. It only downloads when something is missing, so
+idle checks are free. A lock file and a 60-second cooldown prevent overlapping runs and trigger
+feedback loops from the patcher's own writes.
+
+State lives in `~/Library/Application Support/lmstudio-prism-patcher/` (`watcher.log` is the one to
+read if something goes wrong) with the agent at
+`~/Library/LaunchAgents/com.mattwaltbriggs.lmstudio-prism-patcher.plist`.
+
+### Why not an LM Studio plugin?
+
+We checked. LM Studio's plugin API (`@lmstudio/sdk`, `manifest.json` with `"runner": "node"`)
+exposes exactly five registration points on `PluginContext`:
+
+```
+withConfigSchematics  withGlobalConfigSchematics  withPredictionLoopHandler
+withPromptPreprocessor  withToolsProvider  withGenerator
+```
+
+There is **no startup hook, no runtime-update hook and no model-load hook**, so a plugin cannot
+observe a backend being downloaded, and there is no supported way to shell out from one. The
+launchd agent watches the filesystem instead, which is the event that actually matters and works
+regardless of LM Studio's internals.
+
 
 ### Advanced targets
 
@@ -134,9 +180,9 @@ LMSTUDIO_BACKENDS_DIR=/path/to/backends ./prism_patcher.sh
 
 * **LM Studio updates the backend automatically.** With `autoUpdateExtensionPacks` /
   `autoDeleteExtensionPacks` enabled, LM Studio can download a new backend and delete the old
-  one — sometimes *while you are patching*. Re-run the script after each update, or disable
-  those options in **Settings → Developer**. Because the script patches every installed
-  backend, a brand-new version that arrives after the run still needs a re-run.
+  one — sometimes *while you are patching*. Install the [watcher](#automatic-patching-recommended)
+  so this is handled for you, or disable those options in **Settings → Developer** and re-run the
+  script after each update.
 * Only the engine-protocol `llama-server` path (chat/completion) is patched. Embeddings that run
   through the in-process `llm_engine.node` keep using LM Studio's libraries.
 * PrismML's server must remain CLI/API-compatible with the engine protocol LM Studio expects.

@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "=========================================="
-echo " LM Studio PrismML Auto-Patcher (macOS)"
-echo "=========================================="
+# LM Studio PrismML Auto-Patcher (macOS)
+#
+# Usage:
+#   ./prism_patcher.sh                 # patch every installed llama.cpp backend
+#   ./prism_patcher.sh macos-arm64     # override the PrismML target prefix
+#   ./prism_patcher.sh --check         # exit 0 if every backend is already patched
+#                                      # (no network access; used by the watcher)
 
 for cmd in curl jq tar uname; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
@@ -34,8 +38,26 @@ case "$ARCH" in
         ;;
 esac
 
-TARGET="${1:-$DEFAULT_TARGET}"
-echo "Selected target: $TARGET"
+# --- arguments -------------------------------------------------------------
+CHECK_ONLY=0
+TARGET=""
+for arg in "$@"; do
+    case "$arg" in
+        --check) CHECK_ONLY=1 ;;
+        -h|--help)
+            sed -n '4,10p' "$0" | sed 's/^# \{0,1\}//'
+            exit 0
+            ;;
+        -*)
+            echo "Error: unknown option '$arg'."
+            exit 2
+            ;;
+        *)
+            TARGET="$arg"
+            ;;
+    esac
+done
+TARGET="${TARGET:-$DEFAULT_TARGET}"
 
 # Map the PrismML target to LM Studio's backend directory naming convention
 case "$TARGET" in
@@ -46,6 +68,50 @@ case "$TARGET" in
         exit 1
         ;;
 esac
+
+# List matching backends, newest first. Portable "sort -V" because BSD sort has
+# no -V flag: zero-pad each numeric version component, then sort descending.
+find_backends() {
+    find "$BACKENDS_DIR" -maxdepth 1 -type d -name "$BACKEND_PATTERN" 2>/dev/null \
+        | awk -F/ '{
+            v=$NF; sub(/^.*-/, "", v); n=split(v, a, ".");
+            printf "%05d%05d%05d\t%s\n", a[1], a[2], a[3], $0
+        }' \
+        | sort -r | cut -f2
+}
+
+if [ ! -d "$BACKENDS_DIR" ]; then
+    echo "Error: '$BACKENDS_DIR' does not exist. Is LM Studio installed and has it run at least once?"
+    exit 1
+fi
+
+BACKEND_LIST="$(find_backends)"
+
+if [ -z "$BACKEND_LIST" ]; then
+    echo "Error: could not find any LM Studio backend matching '$BACKEND_PATTERN' in $BACKENDS_DIR."
+    exit 1
+fi
+
+# --- quick check mode (no network) -----------------------------------------
+# Used by the launchd watcher: if every backend carries a PrismML stamp, there
+# is nothing to do and we can exit without downloading anything.
+if [ "$CHECK_ONLY" -eq 1 ]; then
+    while IFS= read -r backend; do
+        [ -n "$backend" ] || continue
+        if [ ! -f "$backend/.prism-stamp" ]; then
+            echo "Not patched: $backend"
+            exit 1
+        fi
+    done <<EOF
+$BACKEND_LIST
+EOF
+    exit 0
+fi
+
+echo "=========================================="
+echo " LM Studio PrismML Auto-Patcher (macOS)"
+echo "=========================================="
+echo "Selected target: $TARGET"
 
 # 1. Fetch the latest PrismML release
 echo "[1/4] Querying GitHub for the latest PrismML release..."
@@ -59,6 +125,7 @@ if [ -z "$ASSET_URL" ] || [ "$ASSET_URL" = "null" ]; then
 fi
 
 echo "Found release asset: $ASSET_URL"
+PRISM_RELEASE="$(basename "$(dirname "$ASSET_URL")")"
 
 # 2. Download and extract
 echo "[2/4] Downloading and extracting the archive..."
@@ -154,33 +221,14 @@ patch_backend() {
         return 1
     fi
 
+    # Record which PrismML release this backend was patched with. The watcher
+    # uses this file to decide whether anything needs doing.
+    printf '%s\n' "$PRISM_RELEASE" > "$backend/.prism-stamp"
     return 0
 }
 
-# 3. Locate LM Studio backends for this architecture
+# 3. Report what we found
 echo "[3/4] Locating LM Studio backends matching $BACKEND_PATTERN..."
-
-if [ ! -d "$BACKENDS_DIR" ]; then
-    echo "Error: '$BACKENDS_DIR' does not exist. Is LM Studio installed and has it run at least once?"
-    exit 1
-fi
-
-# Portable "sort -V" (BSD sort has no -V): zero-pad each numeric component.
-# NOTE: we patch *every* matching backend, not just the newest one. LM Studio
-# switches between installed backends on its own (and auto-downloads new ones),
-# so patching only the highest version silently stops working when it switches.
-BACKEND_LIST=$(find "$BACKENDS_DIR" -maxdepth 1 -type d -name "$BACKEND_PATTERN" 2>/dev/null \
-    | awk -F/ '{
-        v=$NF; sub(/^.*-/, "", v); n=split(v, a, ".");
-        printf "%05d%05d%05d\t%s\n", a[1], a[2], a[3], $0
-    }' \
-    | sort -r | cut -f2)
-
-if [ -z "$BACKEND_LIST" ]; then
-    echo "Error: could not find any LM Studio backend matching '$BACKEND_PATTERN' in $BACKENDS_DIR."
-    exit 1
-fi
-
 echo "Found backends:"
 echo "$BACKEND_LIST" | sed 's|.*/|    |'
 
@@ -191,7 +239,7 @@ if [ -f "$INTERNAL_DIR/backend-preferences-v1.json" ]; then
 fi
 
 # 4. Patch every backend
-echo "[4/4] Patching backends..."
+echo "[4/4] Patching backends with $PRISM_RELEASE..."
 PATCHED=0
 FAILED=0
 
